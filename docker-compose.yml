@@ -1,26 +1,66 @@
 services:
+
+  # ── Kafka (KRaft mode — no Zookeeper) ─────────────────────────────────
   kafka:
     image: apache/kafka:latest
     container_name: kafka
-
+    restart: unless-stopped
     ports:
-      - "9092:9092"
-
+      - "9092:9092"    # host machines (Jenkins, kcat, your laptop)
+      - "29092:29092"  # internal Docker network (kafka-ui, Flink)
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+
+      # THREE listeners:
+      #   PLAINTEXT      → host machines via mapped port 9092
+      #   INTERNAL       → other Docker containers via port 29092
+      #   CONTROLLER     → KRaft controller (internal only)
+      KAFKA_LISTENERS: PLAINTEXT://:9092,INTERNAL://:29092,CONTROLLER://:9093
+
+      # Advertise the correct address for each listener:
+      #   PLAINTEXT  → localhost:9092   (host / external clients)
+      #   INTERNAL   → kafka:29092      (Docker-internal clients like kafka-ui)
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # KRaft quorum — controller talks on the CONTROLLER listener
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 168       # 7 days — good for DORA event replay
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
     volumes:
       - kafka-data:/var/lib/kafka/data
+
+  # ── Kafka UI (provectuslabs) ───────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy   # waits until broker healthcheck passes
+    ports:
+      - "8081:8080"   # open http://localhost:8080
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-kraft
+      # ✅ KEY FIX: Docker service name + INTERNAL port, not localhost:9092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: 'true'
+      AUTH_TYPE: "DISABLED"
 
 volumes:
   kafka-data:
