@@ -1,6 +1,8 @@
 pipeline {
     agent any
-
+   triggers {
+        pollSCM('H/1 * * * *')
+    }
     environment {
         ANALYSIS_NAME = 'ccid-observabillity-flink-analysis'
         SERVICE_NAME = 'bloodpressure-backend-service'
