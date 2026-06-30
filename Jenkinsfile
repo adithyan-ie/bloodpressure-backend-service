@@ -41,13 +41,23 @@ EOF
 }
 
 def sendToKafka(Map args) {
-    // ── FIX: use `docker exec -i kcat` instead of calling kcat directly.
-    // Jenkins container doesn't have kcat installed, but the kcat container
-    // does. The Docker socket mount on the Jenkins container allows this.
     sh """
         set -eu
         echo "==> Sending ${args.eventType} [${args.status}] to Kafka via kcat container"
-        docker exec -i kcat kcat \\
+
+        # ── KEY FIX ───────────────────────────────────────────────────────
+        # Compact the JSON to a single line first using python3, then pipe
+        # it to kcat.  This guarantees kcat receives exactly ONE message
+        # regardless of how many lines the pretty-printed JSON file has.
+        #
+        # Without this, kcat splits on newlines by default and each line
+        # of the JSON becomes a separate Kafka message.
+        # ──────────────────────────────────────────────────────────────────
+        python3 -c "
+import json, sys
+with open('${args.fileName}') as f:
+    print(json.dumps(json.load(f), separators=(',', ':')), end='')
+" | docker exec -i kcat kcat \\
             -P \\
             -b kafka:29092 \\
             -t \${KAFKA_TOPIC} \\
@@ -55,8 +65,9 @@ def sendToKafka(Map args) {
             -H "content-type=application/json" \\
             -H "stage=${args.stage}" \\
             -H "status=${args.status}" \\
-            -H "build_number=\${BUILD_NUMBER}" < ${args.fileName}
-        echo "==> ${args.eventType} [${args.status}] delivered to Kafka"
+            -H "build_number=\${BUILD_NUMBER}"
+
+        echo "==> ${args.eventType} [${args.status}] delivered as single Kafka message"
     """
 }
 
@@ -84,7 +95,6 @@ pipeline {
         ANALYSIS_NAME = 'ccid-observabillity-flink-analysis'
         SERVICE_NAME  = 'bloodpressure-backend-service'
         KAFKA_TOPIC   = 'cicd-events'
-        // kcat container connects to kafka:29092 internally — no KAFKA_BOOTSTRAP needed
     }
 
     stages {
@@ -219,6 +229,7 @@ pipeline {
                         sonar_status=$(read_status sonarqube_started_event.json)
                         package_status=$(read_status package_started_event.json)
 
+                        # Build the aggregated payload as pretty JSON first
                         cat > events.json <<EOF
 {
   "analysis_name":  "${ANALYSIS_NAME}",
@@ -288,11 +299,16 @@ pipeline {
   ]
 }
 EOF
-                        echo "==> Aggregated events.json"
+                        echo "==> Aggregated events.json (pretty):"
                         cat events.json
 
-                        echo "==> Sending PIPELINE_COMPLETED to Kafka via kcat container"
-                        docker exec -i kcat kcat \
+                        # Compact to single line before sending to Kafka
+                        echo "==> Sending PIPELINE_COMPLETED as single Kafka message"
+                        python3 -c "
+import json, sys
+with open('events.json') as f:
+    print(json.dumps(json.load(f), separators=(',', ':')), end='')
+" | docker exec -i kcat kcat \
                             -P \
                             -b kafka:29092 \
                             -t "${KAFKA_TOPIC}" \
@@ -300,8 +316,9 @@ EOF
                             -H "content-type=application/json" \
                             -H "stage=Aggregate" \
                             -H "status=SUCCESS" \
-                            -H "build_number=${BUILD_NUMBER}" < events.json
-                        echo "==> PIPELINE_COMPLETED delivered to Kafka"
+                            -H "build_number=${BUILD_NUMBER}"
+
+                        echo "==> PIPELINE_COMPLETED delivered as single Kafka message"
                     '''
                     archiveArtifacts artifacts: 'events.json', fingerprint: true
                 }

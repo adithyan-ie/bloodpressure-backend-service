@@ -6,8 +6,8 @@ services:
     container_name: kafka
     restart: unless-stopped
     ports:
-      - "9092:9092"    # host machines (Jenkins, kcat, your laptop)
-      - "29092:29092"  # internal Docker network (kafka-ui, Flink)
+      - "9092:9092"      # host machines (your laptop, host tools)
+      - "29092:29092"    # internal Docker network (kafka-ui, kcat, Jenkins)
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -31,6 +31,8 @@ services:
       start_period: 30s
     volumes:
       - kafka-data:/var/lib/kafka/data
+    networks:
+      - cicd-network
 
   # ── Kafka UI ───────────────────────────────────────────────────────────
   kafka-ui:
@@ -41,25 +43,18 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "8081:8080"
+      - "8081:8080"    # http://localhost:8081
     environment:
       KAFKA_CLUSTERS_0_NAME: local-kraft
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       DYNAMIC_CONFIG_ENABLED: 'true'
       AUTH_TYPE: "DISABLED"
+    networks:
+      - cicd-network
 
-  # ── kcat (kafkacat) ────────────────────────────────────────────────────
-  # Lightweight CLI tool for producing and consuming Kafka messages.
-  # Used by the Jenkins pipeline (sendToKafka function) to publish
-  # per-stage CI/CD events to the cicd-events topic.
-  #
-  # The container stays running via `tail -f /dev/null` so Jenkins can
-  # exec into it at any time with:
-  #   docker exec kcat kcat -P -b kafka:29092 -t cicd-events ...
-  #
-  # It is also available on the HOST via the mapped port — from your
-  # terminal you can run:
-  #   docker exec kcat kcat -C -b kafka:29092 -t cicd-events -e
+  # ── kcat ──────────────────────────────────────────────────────────────
+  # Stays alive so Jenkins can exec into it to send Kafka messages:
+  #   docker exec -i kcat kcat -P -b kafka:29092 -t cicd-events ...
   kcat:
     image: confluentinc/cp-kcat:latest
     container_name: kcat
@@ -67,12 +62,53 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["tail", "-f", "/dev/null"]   # keep container alive indefinitely
+    entrypoint: ["tail", "-f", "/dev/null"]
     environment:
-      # Pre-configure the default broker so you can call kcat without -b
       KCAT_BROKERS: kafka:29092
     networks:
-      - default
+      - cicd-network
+
+  # ── Jenkins ────────────────────────────────────────────────────────────
+  # Runs on the same Docker network so it can:
+  #   1. Reach Kafka directly on kafka:29092
+  #   2. Run `docker exec -i kcat kcat ...` via the Docker socket mount
+  jenkins:
+    image: jenkins/jenkins:lts
+    container_name: jenkins
+    restart: unless-stopped
+    user: root    # needed to access /var/run/docker.sock
+    ports:
+      - "8080:8080"     # Jenkins UI  → http://localhost:8080
+      - "50000:50000"   # Jenkins agent inbound port
+    volumes:
+      - jenkins-data:/var/jenkins_home
+      # Mount Docker socket so Jenkins can run `docker exec` against
+      # the kcat container without needing kcat installed locally.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Skip the initial setup wizard — remove this line for first-time
+      # production installs where you want the wizard.
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+    # Install Docker CLI on container startup so `docker exec` is available
+    # inside Jenkins pipeline shell steps.
+    command: >
+      bash -c "
+        apt-get update -qq &&
+        apt-get install -y -qq docker.io &&
+        /usr/bin/tini -- /usr/local/bin/jenkins.sh
+      "
+    depends_on:
+      kcat:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    networks:
+      - cicd-network
+
+networks:
+  cicd-network:
+    driver: bridge
 
 volumes:
   kafka-data:
+  jenkins-data:
