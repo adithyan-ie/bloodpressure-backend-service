@@ -1,24 +1,8 @@
 // ══════════════════════════════════════════════════════════════════════════════
-// Shared library functions — defined once, called from every stage.
-//
-//  generateEvent(args)   → writes a per-stage JSON file and returns the path
-//  sendToKafka(args)     → sends a JSON file to Kafka via kcat
-//  stageEvent(args)      → generates + sends in one call (normal happy path)
-//  stageEventFailure(args) → same but overwrites status to FAILURE
+// Helper functions
 // ══════════════════════════════════════════════════════════════════════════════
 
 def generateEvent(Map args) {
-    /*
-     * Writes one JSON event file for a pipeline stage.
-     *
-     * Required args:
-     *   eventType   String  e.g. "BUILD_STARTED"
-     *   stage       String  e.g. "Build Started"
-     *   status      String  "SUCCESS" | "FAILURE"
-     *   fileName    String  output file name, e.g. "build_started_event.json"
-     *
-     * Returns: the file name that was written (same as args.fileName)
-     */
     sh """
         set -eu
         branch="\${BRANCH_NAME:-\${GIT_BRANCH:-main}}"
@@ -57,39 +41,26 @@ EOF
 }
 
 def sendToKafka(Map args) {
-    /*
-     * Publishes a JSON file to the configured Kafka topic via kcat.
-     *
-     * Required args:
-     *   fileName    String  path to the JSON file to send
-     *   eventType   String  used as the message key suffix
-     *   stage       String  used as a Kafka message header
-     *   status      String  "SUCCESS" | "FAILURE" — added as a header
-     */
+    // ── FIX: use `docker exec -i kcat` instead of calling kcat directly.
+    // Jenkins container doesn't have kcat installed, but the kcat container
+    // does. The Docker socket mount on the Jenkins container allows this.
     sh """
         set -eu
-        echo "==> Sending ${args.eventType} [${args.status}] to Kafka topic: \${KAFKA_TOPIC}"
-        cat ${args.fileName} | kcat \\
+        echo "==> Sending ${args.eventType} [${args.status}] to Kafka via kcat container"
+        docker exec -i kcat kcat \\
             -P \\
-            -b "\${KAFKA_BOOTSTRAP}" \\
-            -t "\${KAFKA_TOPIC}" \\
+            -b kafka:29092 \\
+            -t \${KAFKA_TOPIC} \\
             -k "\${SERVICE_NAME}:${args.eventType}" \\
             -H "content-type=application/json" \\
             -H "stage=${args.stage}" \\
             -H "status=${args.status}" \\
-            -H "build_number=\${BUILD_NUMBER}"
+            -H "build_number=\${BUILD_NUMBER}" < ${args.fileName}
         echo "==> ${args.eventType} [${args.status}] delivered to Kafka"
     """
 }
 
 def stageEvent(Map args) {
-    /*
-     * Convenience wrapper: generate JSON + send to Kafka for a SUCCESS event.
-     * Also archives the file as a Jenkins build artefact.
-     *
-     * Required args:  eventType, stage, fileName
-     * Status is always "SUCCESS" — use stageEventFailure for failures.
-     */
     args.status = 'SUCCESS'
     generateEvent(args)
     sendToKafka(args)
@@ -97,13 +68,6 @@ def stageEvent(Map args) {
 }
 
 def stageEventFailure(Map args) {
-    /*
-     * Convenience wrapper: generate JSON + send to Kafka for a FAILURE event.
-     * Intended for use inside post { failure } blocks.
-     *
-     * Required args:  eventType, stage, fileName
-     * Status is always "FAILURE".
-     */
     args.status = 'FAILURE'
     generateEvent(args)
     sendToKafka(args)
@@ -111,17 +75,16 @@ def stageEventFailure(Map args) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Pipeline definition
+// Pipeline
 // ══════════════════════════════════════════════════════════════════════════════
 pipeline {
     agent any
-    environment {
-        ANALYSIS_NAME   = 'ccid-observabillity-flink-analysis'
-        SERVICE_NAME    = 'bloodpressure-backend-service'
 
-        // Kafka — value stored in Jenkins Credentials Store as Secret Text
-        KAFKA_BOOTSTRAP = 'localhost:9092'  // e.g. localhost:9092
-        KAFKA_TOPIC     = 'cicd-events'
+    environment {
+        ANALYSIS_NAME = 'ccid-observabillity-flink-analysis'
+        SERVICE_NAME  = 'bloodpressure-backend-service'
+        KAFKA_TOPIC   = 'cicd-events'
+        // kcat container connects to kafka:29092 internally — no KAFKA_BOOTSTRAP needed
     }
 
     stages {
@@ -236,8 +199,6 @@ pipeline {
 
         // ══════════════════════════════════════════════════════════════════
         // STAGE 5 — Aggregate Events JSON
-        // Merges all per-stage files into one events.json and sends a
-        // single PIPELINE_COMPLETED summary event to Kafka.
         // ══════════════════════════════════════════════════════════════════
         stage('Aggregate Events JSON') {
             steps {
@@ -248,7 +209,6 @@ pipeline {
                         commit_sha="${GIT_COMMIT:-unknown}"
                         timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-                        # Read real statuses from each per-stage file
                         read_status() {
                             python3 -c "import json; print(json.load(open('$1'))['event']['status'])" \
                                 2>/dev/null || echo "UNKNOWN"
@@ -331,16 +291,16 @@ EOF
                         echo "==> Aggregated events.json"
                         cat events.json
 
-                        echo "==> Sending PIPELINE_COMPLETED to Kafka topic: ${KAFKA_TOPIC}"
-                        cat events.json | kcat \
+                        echo "==> Sending PIPELINE_COMPLETED to Kafka via kcat container"
+                        docker exec -i kcat kcat \
                             -P \
-                            -b "${KAFKA_BOOTSTRAP}" \
+                            -b kafka:29092 \
                             -t "${KAFKA_TOPIC}" \
                             -k "${SERVICE_NAME}:PIPELINE_COMPLETED" \
                             -H "content-type=application/json" \
                             -H "stage=Aggregate" \
                             -H "status=SUCCESS" \
-                            -H "build_number=${BUILD_NUMBER}"
+                            -H "build_number=${BUILD_NUMBER}" < events.json
                         echo "==> PIPELINE_COMPLETED delivered to Kafka"
                     '''
                     archiveArtifacts artifacts: 'events.json', fingerprint: true
@@ -356,14 +316,14 @@ EOF
         failure {
             echo "❌ Pipeline failed for ${env.SERVICE_NAME}"
         }
-       always {
-    script {
-        try {
-            archiveArtifacts artifacts: '*_event.json', allowEmptyArchive: true
-        } catch (Exception e) {
-            echo "⚠️  Could not archive — no workspace: ${e.message}"
-        }
-    }
+        always {
+            script {
+                try {
+                    archiveArtifacts artifacts: '*_event.json', allowEmptyArchive: true
+                } catch (Exception e) {
+                    echo "⚠️  Could not archive artefacts: ${e.message}"
+                }
+            }
         }
     }
 }
