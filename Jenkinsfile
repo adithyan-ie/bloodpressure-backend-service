@@ -120,7 +120,7 @@ pipeline {
         SERVICE_NAME    = 'bloodpressure-backend-service'
 
         // Kafka — value stored in Jenkins Credentials Store as Secret Text
-        KAFKA_BOOTSTRAP = credentials('kafka-bootstrap-servers')  // e.g. localhost:9092
+        KAFKA_BOOTSTRAP = 'localhost:9092'  // e.g. localhost:9092
         KAFKA_TOPIC     = 'cicd-events'
     }
 
@@ -356,10 +356,14 @@ EOF
         failure {
             echo "❌ Pipeline failed for ${env.SERVICE_NAME}"
         }
-        always {
-            // Safety net — archive any per-stage files even if the
-            // Aggregate stage was skipped due to an earlier failure
+       always {
+    script {
+        try {
             archiveArtifacts artifacts: '*_event.json', allowEmptyArchive: true
+        } catch (Exception e) {
+            echo "⚠️  Could not archive — no workspace: ${e.message}"
+        }
+    }
         }
     }
 }
