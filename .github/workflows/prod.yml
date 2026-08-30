@@ -1,61 +1,64 @@
-name: Deploy JAR app to Azure Web App - bp-test-java-app
-
-on:
-  push:
-    branches: [ release ]
-  pull_request:
-    branches: [ release ]
-
-jobs:
-
-  deploy-prod:
-    runs-on: ubuntu-latest
-    environment:
-      name: production
-    steps:
-      - name: Cache Maven
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-m2
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build API
-        run: mvn clean package -DskipTests
-
-      # Always deploy to staging slot first
-      - name: Deploy to production Slot
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: 'blood-pressure-prod'
-          slot-name: 'production'
-          package: '*.jar'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_PROD }}
-
-#      # Health check before swapping
-#      - name: Smoke test on staging
-#        run: |
-#          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://bp-test-java-app-staging.azurewebsites.net/actuator/health)
-#          if [ "$STATUS" -ne 200 ]; then
-#            echo "❌ Smoke test failed"
-#            exit 1
-#          fi
-#          echo "✅ Staging slot healthy"
+# DISABLED — CI/CD is now driven by Jenkins (see ./Jenkinsfile). Kept here,
+# fully commented out, rather than deleted, per project decision.
 #
-#      # Swap only if on release branch
-#      - name: Swap Staging → Production
-#        if: github.ref_name == 'release'
-#        uses: azure/cli@v2
-#        with:
-#          inlineScript: |
-#            echo "Swapping slots..."
-#            az webapp deployment slot swap \
-#              --name bp-test-java-app \
-#              --resource-group YOUR_RESOURCE_GROUP_NAME \
-#              --slot staging \
-#              --target-slot production
-#            echo "Swap complete"
+# name: Deploy JAR app to Azure Web App - bp-test-java-app
+#
+# on:
+#   push:
+#     branches: [ release ]
+#   pull_request:
+#     branches: [ release ]
+#
+# jobs:
+#
+#   deploy-prod:
+#     runs-on: ubuntu-latest
+#     environment:
+#       name: production
+#     steps:
+#       - name: Cache Maven
+#         uses: actions/cache@v4
+#         with:
+#           path: ~/.m2/repository
+#           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+#           restore-keys: |
+#             ${{ runner.os }}-m2
+#
+#       - name: Checkout repository
+#         uses: actions/checkout@v4
+#
+#       - name: Build API
+#         run: mvn clean package -DskipTests
+#
+#       # Always deploy to staging slot first
+#       - name: Deploy to production Slot
+#         uses: azure/webapps-deploy@v3
+#         with:
+#           app-name: 'blood-pressure-prod'
+#           slot-name: 'production'
+#           package: '*.jar'
+#           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_PROD }}
+#
+# #      # Health check before swapping
+# #      - name: Smoke test on staging
+# #        run: |
+# #          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://bp-test-java-app-staging.azurewebsites.net/actuator/health)
+# #          if [ "$STATUS" -ne 200 ]; then
+# #            echo "❌ Smoke test failed"
+# #            exit 1
+# #          fi
+# #          echo "✅ Staging slot healthy"
+# #
+# #      # Swap only if on release branch
+# #      - name: Swap Staging → Production
+# #        if: github.ref_name == 'release'
+# #        uses: azure/cli@v2
+# #        with:
+# #          inlineScript: |
+# #            echo "Swapping slots..."
+# #            az webapp deployment slot swap \
+# #              --name bp-test-java-app \
+# #              --resource-group YOUR_RESOURCE_GROUP_NAME \
+# #              --slot staging \
+# #              --target-slot production
+# #            echo "Swap complete"

@@ -8,7 +8,7 @@ def generateEvent(Map args) {
         branch="\${BRANCH_NAME:-\${GIT_BRANCH:-main}}"
         commit_sha="\${GIT_COMMIT:-unknown}"
         timestamp="\$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-        event_id="\${JOB_NAME}-\${BUILD_NUMBER}-${args.eventType.toLowerCase().replace('_', '-')}"
+        event_id="\${JOB_NAME}-\${BUILD_NUMBER}-${args.eventType.toLowerCase().replace('_', '-')}${args.idSuffix ? '-' + args.idSuffix : ''}"
 
         cat > ${args.fileName} <<EOF
 {
@@ -40,6 +40,23 @@ EOF
     return args.fileName
 }
 
+// The kcat container is the single source of truth for where Kafka is —
+// its KCAT_BROKERS env var is set correctly for whatever topology it was
+// started with (same-host docker-compose.yml here uses "kafka:29092"; the
+// reference Flink job repo's deploy/AWS/jenkins/docker-compose.yml sets it
+// to "${DATA_LAYER_HOST}:9092" for a Kafka running on a separate EC2). This
+// pipeline never needs to know or guess that address itself — it just asks
+// kcat, exactly like the reference repo's own documented usage
+// (`kcat -P -b $KCAT_BROKERS ...`). Resolved once, in the 'Resolve Kafka
+// Broker' stage, and reused via env.KAFKA_BROKER for the rest of the build
+// rather than re-querying kcat on every single event.
+def kafkaBroker() {
+    return sh(
+        script: 'docker exec kcat sh -c \'echo "$KCAT_BROKERS"\'',
+        returnStdout: true
+    ).trim()
+}
+
 def sendToKafka(Map args) {
     sh """
         set -eu
@@ -59,30 +76,77 @@ with open('${args.fileName}') as f:
     print(json.dumps(json.load(f), separators=(',', ':')), end='')
 " | docker exec -i kcat kcat \\
             -P \\
-            -b kafka:29092 \\
+            -b "\${KAFKA_BROKER}" \\
             -t \${KAFKA_TOPIC} \\
+            -p 0 \\
             -k "\${SERVICE_NAME}:${args.eventType}" \\
             -H "content-type=application/json" \\
             -H "stage=${args.stage}" \\
             -H "status=${args.status}" \\
             -H "build_number=\${BUILD_NUMBER}"
 
-        echo "==> ${args.eventType} [${args.status}] delivered as single Kafka message"
+        echo "==> ${args.eventType} [${args.status}] produced to Kafka"
     """
 }
 
-def stageEvent(Map args) {
-    args.status = 'SUCCESS'
-    generateEvent(args)
-    sendToKafka(args)
-    archiveArtifacts artifacts: args.fileName, fingerprint: true
+// Reads the last message back off the topic partition and confirms it is
+// the event we just produced. Fails the stage (non-zero exit) if the
+// message can't be read back or doesn't match — this is what actually
+// proves the event reached Kafka, rather than just trusting kcat's exit
+// code from the produce step.
+def verifyKafkaDelivery(Map args) {
+    sh """
+        set -eu
+        echo "==> Verifying ${args.eventType} landed on Kafka topic \${KAFKA_TOPIC}"
+
+        expected_event_id="\${JOB_NAME}-\${BUILD_NUMBER}-${args.eventType.toLowerCase().replace('_', '-')}${args.idSuffix ? '-' + args.idSuffix : ''}"
+
+        actual="\$(docker exec -i kcat kcat \\
+            -C \\
+            -b "\${KAFKA_BROKER}" \\
+            -t \${KAFKA_TOPIC} \\
+            -p 0 \\
+            -o -1 \\
+            -e \\
+            -q 2>/dev/null || true)"
+
+        if [ -z "\$actual" ]; then
+            echo "!! Verification FAILED: could not read back any message from Kafka for ${args.eventType}"
+            exit 1
+        fi
+
+        case "\$actual" in
+            *"\$expected_event_id"*)
+                echo "==> Verified: ${args.eventType} [${args.status}] confirmed on Kafka (event_id=\$expected_event_id)"
+                ;;
+            *)
+                echo "!! Verification FAILED: last message on topic does not match expected event_id=\$expected_event_id"
+                echo "   last message read back: \$actual"
+                exit 1
+                ;;
+        esac
+    """
 }
 
-def stageEventFailure(Map args) {
-    args.status = 'FAILURE'
-    generateEvent(args)
-    sendToKafka(args)
-    archiveArtifacts artifacts: args.fileName, fingerprint: true
+// Kafka is an observability side-channel, not the pipeline's actual work —
+// a broker hiccup or a bad read-back must never be what fails the build.
+// Any failure in generate/send/verify is caught here and only ever softens
+// the result to UNSTABLE, and only when the build isn't already FAILED for
+// a real reason (e.g. this same call reporting a genuine stage failure from
+// a post{failure{}} block while Kafka also happens to be down) — a Kafka
+// hiccup must never downgrade an actual pipeline failure back to UNSTABLE.
+def emitStageEvent(Map args) {
+    try {
+        generateEvent(args)
+        sendToKafka(args)
+        verifyKafkaDelivery(args)
+        archiveArtifacts artifacts: args.fileName, fingerprint: true
+    } catch (Exception e) {
+        echo "⚠️  Kafka event emission failed for ${args.eventType} [${args.stage}]: ${e.message}"
+        if (currentBuild.result != 'FAILURE') {
+            currentBuild.result = 'UNSTABLE'
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -91,7 +155,7 @@ def stageEventFailure(Map args) {
 pipeline {
     agent any
 
-      triggers {
+    triggers {
         pollSCM('H/1 * * * *')
     }
 
@@ -99,31 +163,91 @@ pipeline {
         ANALYSIS_NAME = 'ccid-observabillity-flink-analysis'
         SERVICE_NAME  = 'bloodpressure-backend-service'
         KAFKA_TOPIC   = 'cicd-events'
+        // No Kafka host/port here on purpose — the kcat container (started
+        // separately, e.g. via the reference Flink job repo's
+        // deploy/AWS/jenkins/docker-compose.yml) already knows its own
+        // broker address via its KCAT_BROKERS env var. See kafkaBroker().
+        // KAFKA_BROKER itself is resolved once, in the 'Resolve Kafka
+        // Broker' stage below, and reused by every later stage.
     }
 
     stages {
 
         // ══════════════════════════════════════════════════════════════════
-        // STAGE 1 — Build Started
+        // STAGE 0 — Resolve Kafka Broker
+        // Queries the kcat container's own KCAT_BROKERS env var exactly
+        // once per build and stores it in env.KAFKA_BROKER for every later
+        // stage to reuse, instead of re-querying kcat on every single event.
+        // A failure here is a Kafka-side problem, not a pipeline failure —
+        // same UNSTABLE-not-FAILURE handling as emitStageEvent, since every
+        // later Kafka push will independently hit (and swallow) the same
+        // failure anyway if the broker can't be resolved.
         // ══════════════════════════════════════════════════════════════════
-        stage('Build Started') {
+        stage('Resolve Kafka Broker') {
             steps {
-                echo "Build started for ${env.SERVICE_NAME}"
                 script {
-                    stageEvent(
+                    try {
+                        env.KAFKA_BROKER = kafkaBroker()
+                        echo "==> Kafka broker resolved from kcat container: ${env.KAFKA_BROKER}"
+                    } catch (Exception e) {
+                        echo "⚠️  Could not resolve Kafka broker from kcat container: ${e.message}"
+                        if (currentBuild.result != 'FAILURE') {
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // STAGE 1 — Build
+        // Scripted fail-then-retry-succeeds: BUILD_FAILED followed later by
+        // BUILD_SUCCESS for the same pipeline_id (JOB_NAME) is exactly what
+        // DoraOperators.MttrProcessFn keys off, so this is what actually
+        // produces a Mean Time to Recovery data point in the Flink job.
+        // ══════════════════════════════════════════════════════════════════
+        stage('Build') {
+            steps {
+                script {
+                    emitStageEvent(
                         eventType : 'BUILD_STARTED',
-                        stage     : 'Build Started',
+                        stage     : 'Build',
+                        status    : 'SUCCESS',
                         fileName  : 'build_started_event.json'
                     )
+                    echo "Simulating build attempt #1 for ${env.SERVICE_NAME} (mock pipeline — scripted to fail)"
+                    emitStageEvent(
+                        eventType : 'BUILD_FAILED',
+                        stage     : 'Build',
+                        status    : 'FAILURE',
+                        fileName  : 'build_failed_event.json'
+                    )
+                    echo "Retrying build for ${env.SERVICE_NAME}"
+                    emitStageEvent(
+                        eventType : 'BUILD_STARTED',
+                        stage     : 'Build',
+                        status    : 'SUCCESS',
+                        fileName  : 'build_retry_started_event.json',
+                        idSuffix  : 'retry'
+                    )
+                    echo "Simulating build attempt #2 for ${env.SERVICE_NAME} (succeeds, closing the MTTR window)"
+                    emitStageEvent(
+                        eventType : 'BUILD_SUCCESS',
+                        stage     : 'Build',
+                        status    : 'SUCCESS',
+                        fileName  : 'build_success_event.json'
+                    )
                 }
             }
             post {
                 failure {
                     script {
-                        stageEventFailure(
-                            eventType : 'BUILD_STARTED',
-                            stage     : 'Build Started',
-                            fileName  : 'build_started_event.json'
+                        emitStageEvent(
+                            eventType : 'BUILD_FAILED',
+                            stage     : 'Build',
+                            status    : 'FAILURE',
+                            fileName  : 'build_failed_final_event.json',
+                            idSuffix  : 'final'
                         )
                     }
                 }
@@ -131,26 +255,34 @@ pipeline {
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // STAGE 2 — Test Started
+        // STAGE 2 — Test
         // ══════════════════════════════════════════════════════════════════
-        stage('Test Started') {
+        stage('Test') {
             steps {
-                echo "Test started for ${env.SERVICE_NAME}"
                 script {
-                    stageEvent(
+                    emitStageEvent(
                         eventType : 'TEST_STARTED',
-                        stage     : 'Test Started',
+                        stage     : 'Test',
+                        status    : 'SUCCESS',
                         fileName  : 'test_started_event.json'
                     )
+                    echo "Simulating tests for ${env.SERVICE_NAME} (mock pipeline — no real tests run)"
+                    emitStageEvent(
+                        eventType : 'TEST_SUCCESS',
+                        stage     : 'Test',
+                        status    : 'SUCCESS',
+                        fileName  : 'test_success_event.json'
+                    )
                 }
             }
             post {
                 failure {
                     script {
-                        stageEventFailure(
-                            eventType : 'TEST_STARTED',
-                            stage     : 'Test Started',
-                            fileName  : 'test_started_event.json'
+                        emitStageEvent(
+                            eventType : 'TEST_FAILED',
+                            stage     : 'Test',
+                            status    : 'FAILURE',
+                            fileName  : 'test_failed_event.json'
                         )
                     }
                 }
@@ -158,53 +290,34 @@ pipeline {
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // STAGE 3 — SonarQube Started
+        // STAGE 3 — SonarQube
         // ══════════════════════════════════════════════════════════════════
-        stage('SonarQube Started') {
+        stage('SonarQube') {
             steps {
-                echo "SonarQube scan started for ${env.SERVICE_NAME}"
                 script {
-                    stageEvent(
+                    emitStageEvent(
                         eventType : 'SONARQUBE_STARTED',
-                        stage     : 'SonarQube Started',
+                        stage     : 'SonarQube',
+                        status    : 'SUCCESS',
                         fileName  : 'sonarqube_started_event.json'
                     )
-                }
-            }
-            post {
-                failure {
-                    script {
-                        stageEventFailure(
-                            eventType : 'SONARQUBE_STARTED',
-                            stage     : 'SonarQube Started',
-                            fileName  : 'sonarqube_started_event.json'
-                        )
-                    }
-                }
-            }
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // STAGE 4 — Package Started
-        // ══════════════════════════════════════════════════════════════════
-        stage('Package Started') {
-            steps {
-                echo "Package started for ${env.SERVICE_NAME}"
-                script {
-                    stageEvent(
-                        eventType : 'PACKAGE_STARTED',
-                        stage     : 'Package Started',
-                        fileName  : 'package_started_event.json'
+                    echo "Simulating SonarQube scan for ${env.SERVICE_NAME} (mock pipeline — no real scan runs)"
+                    emitStageEvent(
+                        eventType : 'SONARQUBE_SUCCESS',
+                        stage     : 'SonarQube',
+                        status    : 'SUCCESS',
+                        fileName  : 'sonarqube_success_event.json'
                     )
                 }
             }
             post {
                 failure {
                     script {
-                        stageEventFailure(
-                            eventType : 'PACKAGE_STARTED',
-                            stage     : 'Package Started',
-                            fileName  : 'package_started_event.json'
+                        emitStageEvent(
+                            eventType : 'SONARQUBE_FAILED',
+                            stage     : 'SonarQube',
+                            status    : 'FAILURE',
+                            fileName  : 'sonarqube_failed_event.json'
                         )
                     }
                 }
@@ -212,119 +325,101 @@ pipeline {
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // STAGE 5 — Aggregate Events JSON
+        // STAGE 4 — Package
         // ══════════════════════════════════════════════════════════════════
-        stage('Aggregate Events JSON') {
+        stage('Package') {
             steps {
                 script {
-                    sh '''
-                        set -eu
-                        branch="${BRANCH_NAME:-${GIT_BRANCH:-main}}"
-                        commit_sha="${GIT_COMMIT:-unknown}"
-                        timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+                    emitStageEvent(
+                        eventType : 'PACKAGE_STARTED',
+                        stage     : 'Package',
+                        status    : 'SUCCESS',
+                        fileName  : 'package_started_event.json'
+                    )
+                    echo "Simulating packaging for ${env.SERVICE_NAME} (mock pipeline — no real packaging runs)"
+                    emitStageEvent(
+                        eventType : 'PACKAGE_SUCCESS',
+                        stage     : 'Package',
+                        status    : 'SUCCESS',
+                        fileName  : 'package_success_event.json'
+                    )
+                }
+            }
+            post {
+                failure {
+                    script {
+                        emitStageEvent(
+                            eventType : 'PACKAGE_FAILED',
+                            stage     : 'Package',
+                            status    : 'FAILURE',
+                            fileName  : 'package_failed_event.json'
+                        )
+                    }
+                }
+            }
+        }
 
-                        read_status() {
-                            python3 -c "import json; print(json.load(open('$1'))['event']['status'])" \
-                                2>/dev/null || echo "UNKNOWN"
-                        }
+        // ══════════════════════════════════════════════════════════════════
+        // STAGE 5 — Deploy
+        // Every 4th build only: scripted DEPLOY_FAILED followed by a
+        // successful retry, to feed Change Failure Rate (DoraOperators.CfrAgg
+        // counts both DEPLOY_FAILED and DEPLOY_SUCCESS in-window) without
+        // wiping out LeadTimeProcessFn's per-commit state on every run —
+        // Lead Time for Changes still emits normally on the other 3 of 4
+        // builds.
+        // ══════════════════════════════════════════════════════════════════
+        stage('Deploy') {
+            steps {
+                script {
+                    def isScriptedFailureBuild = (env.BUILD_NUMBER as Integer) % 4 == 0
 
-                        build_status=$(read_status build_started_event.json)
-                        test_status=$(read_status test_started_event.json)
-                        sonar_status=$(read_status sonarqube_started_event.json)
-                        package_status=$(read_status package_started_event.json)
+                    emitStageEvent(
+                        eventType : 'DEPLOY_STARTED',
+                        stage     : 'Deploy',
+                        status    : 'SUCCESS',
+                        fileName  : 'deploy_started_event.json'
+                    )
 
-                        # Build the aggregated payload as pretty JSON first
-                        cat > events.json <<EOF
-{
-  "analysis_name":  "${ANALYSIS_NAME}",
-  "analysis_type":  "flink",
-  "service_name":   "${SERVICE_NAME}",
-  "job_name":       "${JOB_NAME}",
-  "build_number":   "${BUILD_NUMBER}",
-  "build_url":      "${BUILD_URL:-}",
-  "aggregated_at":  "${timestamp}",
-  "events": [
-    {
-      "event_id":        "${JOB_NAME}-${BUILD_NUMBER}-build-started",
-      "pipeline_id":     "${JOB_NAME}",
-      "repository_id":   "${SERVICE_NAME}",
-      "analysis_name":   "${ANALYSIS_NAME}",
-      "analysis_type":   "flink",
-      "service_name":    "${SERVICE_NAME}",
-      "branch":          "${branch}",
-      "commit_sha":      "${commit_sha}",
-      "stage":           "Build Started",
-      "event_type":      "BUILD_STARTED",
-      "event_timestamp": "${timestamp}",
-      "status":          "${build_status}"
-    },
-    {
-      "event_id":        "${JOB_NAME}-${BUILD_NUMBER}-test-started",
-      "pipeline_id":     "${JOB_NAME}",
-      "repository_id":   "${SERVICE_NAME}",
-      "analysis_name":   "${ANALYSIS_NAME}",
-      "analysis_type":   "flink",
-      "service_name":    "${SERVICE_NAME}",
-      "branch":          "${branch}",
-      "commit_sha":      "${commit_sha}",
-      "stage":           "Test Started",
-      "event_type":      "TEST_STARTED",
-      "event_timestamp": "${timestamp}",
-      "status":          "${test_status}"
-    },
-    {
-      "event_id":        "${JOB_NAME}-${BUILD_NUMBER}-sonarqube-started",
-      "pipeline_id":     "${JOB_NAME}",
-      "repository_id":   "${SERVICE_NAME}",
-      "analysis_name":   "${ANALYSIS_NAME}",
-      "analysis_type":   "flink",
-      "service_name":    "${SERVICE_NAME}",
-      "branch":          "${branch}",
-      "commit_sha":      "${commit_sha}",
-      "stage":           "SonarQube Started",
-      "event_type":      "SONARQUBE_STARTED",
-      "event_timestamp": "${timestamp}",
-      "status":          "${sonar_status}"
-    },
-    {
-      "event_id":        "${JOB_NAME}-${BUILD_NUMBER}-package-started",
-      "pipeline_id":     "${JOB_NAME}",
-      "repository_id":   "${SERVICE_NAME}",
-      "analysis_name":   "${ANALYSIS_NAME}",
-      "analysis_type":   "flink",
-      "service_name":    "${SERVICE_NAME}",
-      "branch":          "${branch}",
-      "commit_sha":      "${commit_sha}",
-      "stage":           "Package Started",
-      "event_type":      "PACKAGE_STARTED",
-      "event_timestamp": "${timestamp}",
-      "status":          "${package_status}"
-    }
-  ]
-}
-EOF
-                        echo "==> Aggregated events.json (pretty):"
-                        cat events.json
+                    if (isScriptedFailureBuild) {
+                        echo "Simulating deployment attempt #1 for ${env.SERVICE_NAME} (build #${env.BUILD_NUMBER} — every 4th build is scripted to fail)"
+                        emitStageEvent(
+                            eventType : 'DEPLOY_FAILED',
+                            stage     : 'Deploy',
+                            status    : 'FAILURE',
+                            fileName  : 'deploy_failed_event.json'
+                        )
+                        echo "Retrying deployment for ${env.SERVICE_NAME}"
+                        emitStageEvent(
+                            eventType : 'DEPLOY_STARTED',
+                            stage     : 'Deploy',
+                            status    : 'SUCCESS',
+                            fileName  : 'deploy_retry_started_event.json',
+                            idSuffix  : 'retry'
+                        )
+                        echo "Simulating deployment attempt #2 for ${env.SERVICE_NAME} (succeeds)"
+                    } else {
+                        echo "Simulating deployment for ${env.SERVICE_NAME} (mock pipeline — no real deployment runs)"
+                    }
 
-                        # Compact to single line before sending to Kafka
-                        echo "==> Sending PIPELINE_COMPLETED as single Kafka message"
-                        python3 -c "
-import json, sys
-with open('events.json') as f:
-    print(json.dumps(json.load(f), separators=(',', ':')), end='')
-" | docker exec -i kcat kcat \
-                            -P \
-                            -b kafka:29092 \
-                            -t "${KAFKA_TOPIC}" \
-                            -k "${SERVICE_NAME}:PIPELINE_COMPLETED" \
-                            -H "content-type=application/json" \
-                            -H "stage=Aggregate" \
-                            -H "status=SUCCESS" \
-                            -H "build_number=${BUILD_NUMBER}"
-
-                        echo "==> PIPELINE_COMPLETED delivered as single Kafka message"
-                    '''
-                    archiveArtifacts artifacts: 'events.json', fingerprint: true
+                    emitStageEvent(
+                        eventType : 'DEPLOY_SUCCESS',
+                        stage     : 'Deploy',
+                        status    : 'SUCCESS',
+                        fileName  : 'deploy_success_event.json'
+                    )
+                }
+            }
+            post {
+                failure {
+                    script {
+                        emitStageEvent(
+                            eventType : 'DEPLOY_FAILED',
+                            stage     : 'Deploy',
+                            status    : 'FAILURE',
+                            fileName  : 'deploy_failed_final_event.json',
+                            idSuffix  : 'final'
+                        )
+                    }
                 }
             }
         }
@@ -332,7 +427,7 @@ with open('events.json') as f:
 
     post {
         success {
-            echo "✅ Pipeline completed successfully for ${env.SERVICE_NAME}"
+            echo "✅ Pipeline completed successfully for ${env.SERVICE_NAME} — build started through deploy success, all events verified on Kafka"
         }
         failure {
             echo "❌ Pipeline failed for ${env.SERVICE_NAME}"

@@ -1,205 +1,207 @@
-name: Perform necessary security tests
-on:
-  push:
-    branches: [ qa ]
-  pull_request:
-    types: [opened, synchronize, reopened]
-
-jobs:
-  setup-app:
-    runs-on: ubuntu-latest
-    outputs:
-      app-url: http://localhost:8080
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-
-  k6-performance-test:
-    runs-on: ubuntu-latest
-    needs: setup-app
-    steps:
-
-      - name: Cache Maven
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-m2
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build API
-        run: mvn clean package -DskipTests
-
-      - name: Start Bloodpressure App
-        run: |
-          nohup java -jar target/*.jar &
-          echo "Waiting for app to be ready..."
-          for i in {1..30}; do
-            if nc -z localhost 8080; then
-              echo "App is up!"
-              break
-            fi
-            sleep 2
-          done
-
-      - name: Set up k6
-        uses: grafana/setup-k6-action@v1
-
-      - name: Run k6 performance test
-        uses: grafana/run-k6-action@v1
-        with:
-          path: |
-            k6/post-test.js
-          flags: --out json=results.json
-
-      - name: Upload k6 Performance results
-        uses: actions/upload-artifact@v4
-        with:
-          name: k6-results
-          path: |
-            results.json
-
-
-
-
-  zap-penetration-test:
-    runs-on: ubuntu-latest
-    needs: setup-app   # <--- reuse setup
-    steps:
-
-      - name: Cache Maven
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-m2
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build API
-        run: mvn clean package -DskipTests
-
-      - name: Start Bloodpressure App
-        run: |
-          nohup java -jar target/*.jar &
-          echo "Waiting for app to be ready..."
-          for i in {1..30}; do
-            if nc -z localhost 8080; then
-              echo "App is up!"
-              break
-            fi
-            sleep 2
-          done
-
-      - name: Allow ZAP to write output
-        run: sudo chmod -R a+w $GITHUB_WORKSPACE
-
-      - name: Pull ZAP Docker image
-        run: docker pull ghcr.io/zaproxy/zaproxy:stable
-
-      - name: Run ZAP Full Scan (Docker, host network)
-        continue-on-error: true
-        env:
-          ZAP_WRK: /zap/wrk
-        run: |
-          set -eux
-          # ensure the repo is mounted into container; reports will be written into /zap/wrk (maps to $GITHUB_WORKSPACE)
-          # run container with host network so container can reach app on localhost:8080
-          docker run --rm --network host \
-            -v "${GITHUB_WORKSPACE}":/zap/wrk:rw \
-            ghcr.io/zaproxy/zaproxy:stable \
-            zap-full-scan.py \
-              -t "http://localhost:8080" \
-              --hook /zap/wrk/zap-scripts/post-api.py \
-              -r /zap/wrk/zap-report.html \
-              -J /zap/wrk/zap-report.json \
-              -w /zap/wrk/zap-report.md \
-              -D 5
-
-      - name: Show ZAP reports (short)
-        run: |
-          ls -la $GITHUB_WORKSPACE || true
-          test -f $GITHUB_WORKSPACE/zap-report.html || (echo "zap-report.html not found" && exit 1)
-          echo "Reports created: "
-          ls -l zap-report.* || true
-
-      - name: Upload ZAP report
-        uses: actions/upload-artifact@v4
-        with:
-          name: zap-html-report
-          path: zap-report.html
-
-      - name: Fail only on HIGH severity vulnerabilities
-        run: |
-          echo "Checking zap-report.json for HIGH severity alerts..."
-          HIGH_COUNT=$(jq '[.site[].alerts[] | select(.risk == "High")] | length' zap-report.json)
-
-          echo "High severity count: $HIGH_COUNT"
-
-          if [ "$HIGH_COUNT" -gt 0 ]; then
-            echo "❌ HIGH vulnerabilities found! Failing the job."
-            exit 1
-          else
-            echo "✅ No HIGH vulnerabilities. Job will pass."
-          fi
-          
-
-
-  e2e-test:
-    runs-on: ubuntu-latest
-    needs: setup-app
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache Maven
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-m2
-
-      - name: Build & Run E2E Tests
-        run: mvn clean verify
-
-      - name: Upload E2E HTML Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-html-report
-          path: target/site/surefire-report.html
-
-      - name: Upload artifact for deployment job
-        uses: actions/upload-artifact@v4
-        with:
-          name: java-app
-          path: '${{ github.workspace }}/target/*.jar'
-
-  deploy-qa:
-    needs: [ zap-penetration-test, k6-performance-test, e2e-test ]
-    runs-on: ubuntu-latest
-    environment:
-      name: test
-    steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: java-app
-
-      - name: Deploy to Test Env
-        id: deploy-to-webapp
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: 'blood-pressure-qa'
-          package: '*.jar'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_TEST }}
-
+# DISABLED — CI/CD is now driven by Jenkins (see ./Jenkinsfile). Kept here,
+# fully commented out, rather than deleted, per project decision.
+#
+# name: Perform necessary security tests
+# on:
+#   push:
+#     branches: [ qa ]
+#   pull_request:
+#     types: [opened, synchronize, reopened]
+#
+# jobs:
+#   setup-app:
+#     runs-on: ubuntu-latest
+#     outputs:
+#       app-url: http://localhost:8080
+#     steps:
+#       - uses: actions/checkout@v4
+#
+#       - name: Set up JDK
+#         uses: actions/setup-java@v4
+#         with:
+#           distribution: temurin
+#           java-version: 17
+#
+#   k6-performance-test:
+#     runs-on: ubuntu-latest
+#     needs: setup-app
+#     steps:
+#
+#       - name: Cache Maven
+#         uses: actions/cache@v4
+#         with:
+#           path: ~/.m2/repository
+#           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+#           restore-keys: |
+#             ${{ runner.os }}-m2
+#
+#       - name: Checkout repository
+#         uses: actions/checkout@v4
+#
+#       - name: Build API
+#         run: mvn clean package -DskipTests
+#
+#       - name: Start Bloodpressure App
+#         run: |
+#           nohup java -jar target/*.jar &
+#           echo "Waiting for app to be ready..."
+#           for i in {1..30}; do
+#             if nc -z localhost 8080; then
+#               echo "App is up!"
+#               break
+#             fi
+#             sleep 2
+#           done
+#
+#       - name: Set up k6
+#         uses: grafana/setup-k6-action@v1
+#
+#       - name: Run k6 performance test
+#         uses: grafana/run-k6-action@v1
+#         with:
+#           path: |
+#             k6/post-test.js
+#           flags: --out json=results.json
+#
+#       - name: Upload k6 Performance results
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: k6-results
+#           path: |
+#             results.json
+#
+#
+#
+#
+#   zap-penetration-test:
+#     runs-on: ubuntu-latest
+#     needs: setup-app   # <--- reuse setup
+#     steps:
+#
+#       - name: Cache Maven
+#         uses: actions/cache@v4
+#         with:
+#           path: ~/.m2/repository
+#           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+#           restore-keys: |
+#             ${{ runner.os }}-m2
+#
+#       - name: Checkout repository
+#         uses: actions/checkout@v4
+#
+#       - name: Build API
+#         run: mvn clean package -DskipTests
+#
+#       - name: Start Bloodpressure App
+#         run: |
+#           nohup java -jar target/*.jar &
+#           echo "Waiting for app to be ready..."
+#           for i in {1..30}; do
+#             if nc -z localhost 8080; then
+#               echo "App is up!"
+#               break
+#             fi
+#             sleep 2
+#           done
+#
+#       - name: Allow ZAP to write output
+#         run: sudo chmod -R a+w $GITHUB_WORKSPACE
+#
+#       - name: Pull ZAP Docker image
+#         run: docker pull ghcr.io/zaproxy/zaproxy:stable
+#
+#       - name: Run ZAP Full Scan (Docker, host network)
+#         continue-on-error: true
+#         env:
+#           ZAP_WRK: /zap/wrk
+#         run: |
+#           set -eux
+#           # ensure the repo is mounted into container; reports will be written into /zap/wrk (maps to $GITHUB_WORKSPACE)
+#           # run container with host network so container can reach app on localhost:8080
+#           docker run --rm --network host \
+#             -v "${GITHUB_WORKSPACE}":/zap/wrk:rw \
+#             ghcr.io/zaproxy/zaproxy:stable \
+#             zap-full-scan.py \
+#               -t "http://localhost:8080" \
+#               --hook /zap/wrk/zap-scripts/post-api.py \
+#               -r /zap/wrk/zap-report.html \
+#               -J /zap/wrk/zap-report.json \
+#               -w /zap/wrk/zap-report.md \
+#               -D 5
+#
+#       - name: Show ZAP reports (short)
+#         run: |
+#           ls -la $GITHUB_WORKSPACE || true
+#           test -f $GITHUB_WORKSPACE/zap-report.html || (echo "zap-report.html not found" && exit 1)
+#           echo "Reports created: "
+#           ls -l zap-report.* || true
+#
+#       - name: Upload ZAP report
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: zap-html-report
+#           path: zap-report.html
+#
+#       - name: Fail only on HIGH severity vulnerabilities
+#         run: |
+#           echo "Checking zap-report.json for HIGH severity alerts..."
+#           HIGH_COUNT=$(jq '[.site[].alerts[] | select(.risk == "High")] | length' zap-report.json)
+#
+#           echo "High severity count: $HIGH_COUNT"
+#
+#           if [ "$HIGH_COUNT" -gt 0 ]; then
+#             echo "❌ HIGH vulnerabilities found! Failing the job."
+#             exit 1
+#           else
+#             echo "✅ No HIGH vulnerabilities. Job will pass."
+#           fi
+#
+#
+#
+#   e2e-test:
+#     runs-on: ubuntu-latest
+#     needs: setup-app
+#     steps:
+#       - uses: actions/checkout@v4
+#
+#       - name: Cache Maven
+#         uses: actions/cache@v4
+#         with:
+#           path: ~/.m2/repository
+#           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+#           restore-keys: |
+#             ${{ runner.os }}-m2
+#
+#       - name: Build & Run E2E Tests
+#         run: mvn clean verify
+#
+#       - name: Upload E2E HTML Report
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: e2e-html-report
+#           path: target/site/surefire-report.html
+#
+#       - name: Upload artifact for deployment job
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: java-app
+#           path: '${{ github.workspace }}/target/*.jar'
+#
+#   deploy-qa:
+#     needs: [ zap-penetration-test, k6-performance-test, e2e-test ]
+#     runs-on: ubuntu-latest
+#     environment:
+#       name: test
+#     steps:
+#       - name: Download artifact from build job
+#         uses: actions/download-artifact@v4
+#         with:
+#           name: java-app
+#
+#       - name: Deploy to Test Env
+#         id: deploy-to-webapp
+#         uses: azure/webapps-deploy@v3
+#         with:
+#           app-name: 'blood-pressure-qa'
+#           package: '*.jar'
+#           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_TEST }}
