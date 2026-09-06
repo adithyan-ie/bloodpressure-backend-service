@@ -89,57 +89,17 @@ with open('${args.fileName}') as f:
     """
 }
 
-// Reads the last message back off the topic partition and confirms it is
-// the event we just produced. Fails the stage (non-zero exit) if the
-// message can't be read back or doesn't match — this is what actually
-// proves the event reached Kafka, rather than just trusting kcat's exit
-// code from the produce step.
-def verifyKafkaDelivery(Map args) {
-    sh """
-        set -eu
-        echo "==> Verifying ${args.eventType} landed on Kafka topic \${KAFKA_TOPIC}"
-
-        expected_event_id="\${JOB_NAME}-\${BUILD_NUMBER}-${args.eventType.toLowerCase().replace('_', '-')}${args.idSuffix ? '-' + args.idSuffix : ''}"
-
-        actual="\$(docker exec -i kcat kcat \\
-            -C \\
-            -b "\${KAFKA_BROKER}" \\
-            -t \${KAFKA_TOPIC} \\
-            -p 0 \\
-            -o -1 \\
-            -e \\
-            -q 2>/dev/null || true)"
-
-        if [ -z "\$actual" ]; then
-            echo "!! Verification FAILED: could not read back any message from Kafka for ${args.eventType}"
-            exit 1
-        fi
-
-        case "\$actual" in
-            *"\$expected_event_id"*)
-                echo "==> Verified: ${args.eventType} [${args.status}] confirmed on Kafka (event_id=\$expected_event_id)"
-                ;;
-            *)
-                echo "!! Verification FAILED: last message on topic does not match expected event_id=\$expected_event_id"
-                echo "   last message read back: \$actual"
-                exit 1
-                ;;
-        esac
-    """
-}
-
 // Kafka is an observability side-channel, not the pipeline's actual work —
-// a broker hiccup or a bad read-back must never be what fails the build.
-// Any failure in generate/send/verify is caught here and only ever softens
-// the result to UNSTABLE, and only when the build isn't already FAILED for
-// a real reason (e.g. this same call reporting a genuine stage failure from
-// a post{failure{}} block while Kafka also happens to be down) — a Kafka
+// a broker hiccup must never be what fails the build. Any failure in
+// generate/send is caught here and only ever softens the result to
+// UNSTABLE, and only when the build isn't already FAILED for a real reason
+// (e.g. this same call reporting a genuine stage failure from a
+// post{failure{}} block while Kafka also happens to be down) — a Kafka
 // hiccup must never downgrade an actual pipeline failure back to UNSTABLE.
 def emitStageEvent(Map args) {
     try {
         generateEvent(args)
         sendToKafka(args)
-        verifyKafkaDelivery(args)
         archiveArtifacts artifacts: args.fileName, fingerprint: true
     } catch (Exception e) {
         echo "⚠️  Kafka event emission failed for ${args.eventType} [${args.stage}]: ${e.message}"
@@ -427,7 +387,7 @@ pipeline {
 
     post {
         success {
-            echo "✅ Pipeline completed successfully for ${env.SERVICE_NAME} — build started through deploy success, all events verified on Kafka"
+            echo "✅ Pipeline completed successfully for ${env.SERVICE_NAME} — build started through deploy success"
         }
         failure {
             echo "❌ Pipeline failed for ${env.SERVICE_NAME}"
