@@ -85,16 +85,20 @@ services:
       # Mount Docker socket so Jenkins can run `docker exec` against
       # the kcat container without needing kcat installed locally.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Seed admin/admin credentials on every startup (init.groovy.d
+      # scripts in JENKINS_HOME run on each boot, not just the first).
+      - ./jenkins/init.groovy.d:/var/jenkins_home/init.groovy.d:ro
     environment:
       # Skip the initial setup wizard — remove this line for first-time
       # production installs where you want the wizard.
       JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
-    # Install Docker CLI on container startup so `docker exec` is available
-    # inside Jenkins pipeline shell steps.
+    # Install Docker CLI and python3 on container startup so `docker exec`
+    # and the JSON-compaction step are available inside Jenkins pipeline
+    # shell steps.
     command: >
       bash -c "
         apt-get update -qq &&
-        apt-get install -y -qq docker.io &&
+        apt-get install -y -qq docker.io python3 &&
         /usr/bin/tini -- /usr/local/bin/jenkins.sh
       "
     depends_on:
